@@ -1,8 +1,8 @@
-# CUDA SGEMM Performance Lab
+# CUDA FP32 GEMM Kernel实现与性能优化
 
-A CUDA SGEMM performance-engineering project covering kernel optimization,
-compile-time parameter search, shape-aware dispatch, correctness validation,
-and Nsight Compute bottleneck analysis.
+A CUDA FP32 GEMM performance-engineering project covering kernel
+implementation, compile-time parameter search, shape-aware dispatch,
+correctness validation, and Nsight Compute bottleneck analysis.
 
 ## Highlights
 
@@ -16,6 +16,47 @@ and Nsight Compute bottleneck analysis.
   unmeasured shapes.
 - Used Nsight Compute and controlled experiments to explain why later
   double-buffering attempts were slower.
+
+## Kernel optimization path
+
+```mermaid
+flowchart TB
+    subgraph S1["Global memory to shared memory"]
+        direction LR
+        K1["K1 Naive<br/>one thread computes one C element"]
+        K2["K2 Coalesced access<br/>a warp reads contiguous addresses"]
+        K3["K3 Shared-memory tile<br/>a block reuses A and B tiles"]
+        K1 --> K2 --> K3
+    end
+
+    subgraph S2["More work and reuse per thread"]
+        direction LR
+        K4["K4 1D block tiling<br/>one thread computes multiple rows"]
+        K5["K5 2D block tiling<br/>one thread computes a TM x TN tile"]
+        K6["K6 Vectorized access<br/>float4 global-memory transactions"]
+        K4 --> K5 --> K6
+    end
+
+    subgraph S3["Layout and execution mapping"]
+        direction LR
+        K7["K7 Shared-memory layout<br/>reduce bank conflicts"]
+        K8["K8 Padded layout<br/>change conflicting bank mapping"]
+        K9["K9 Static tuning<br/>select stronger tile parameters"]
+        K7 --> K8 --> K9
+    end
+
+    subgraph S4["Warp scheduling and overlap"]
+        direction LR
+        K10["K10 Warp tiling<br/>config 21 selected"]
+        K11["K11 Split double buffer<br/>rejected: barrier imbalance"]
+        K12["K12 Async copy<br/>rejected: MIO and instruction cost"]
+        K10 --> K11 --> K12
+    end
+
+    K3 --> K4
+    K6 --> K7
+    K9 --> K10
+```
 
 ## Result
 
