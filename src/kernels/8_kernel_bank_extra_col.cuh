@@ -9,6 +9,9 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+// padding warp内的thread访问B的同列时可能会出现bankconflict，解决方法就是在B的列上增加一些padding，避免同一时刻访问同一bank
+
+
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void sgemmResolveBankExtraCol(int M, int N, int K, float alpha,
                                          float *A, float *B, float beta,

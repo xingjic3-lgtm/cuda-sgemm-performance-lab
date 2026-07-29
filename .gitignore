@@ -1,16 +1,55 @@
-build/
+# Local build products
+build*/
+**/build/**
 cmake-build-debug/
 cmake-build-release/
-.idea/
+pytorch/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+*.ninja
+.ninja_deps
+.ninja_log
 
-# VSCode, but include settings.json
+# Compiler and linker outputs
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+
+# CUDA intermediate and device binaries
+*.ptx
+*.cubin
+*.fatbin
+*.cudafe*
+
+# Nsight Compute binary reports are large and machine-specific.
+*.ncu-rep
+
+# Runtime diagnostics
+matrixValidationFailure.txt
+
+# Python and editor state
+__pycache__/
+*.py[cod]
+.vs/
+.idea/
 .vscode/*
 !.vscode/launch.json
 !.vscode/settings.json
 
-# binaries
-cuBLAS_sgemm
-simplest
-
-# benchmark results
+# Standalone binaries and generated benchmark data
+/sgemm
+/cuBLAS_sgemm
+/simplest_kernel
 benchmark_results/

@@ -11,6 +11,10 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+#ifndef SGEMM_K12_PACED_ASYNC
+#define SGEMM_K12_PACED_ASYNC 0
+#endif
+
 namespace {
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB, typename T>
@@ -45,6 +49,80 @@ __device__ void loadFromGmem(int N, int K, float *A, float *B, float *As,
   }
 }
 
+template <const int BM, const int BN, const int BK, const int rowStrideA,
+          const int rowStrideB, typename T>
+__device__ void loadFromGmemStep(uint step, int N, int K, float *A, float *B,
+                                 float *As, float *Bs, int innerRowA,
+                                 int innerColA, int innerRowB, int innerColB,
+                                 T &barrier) {
+  constexpr uint aRowIterations = (BM + rowStrideA - 1) / rowStrideA;
+  constexpr uint aCopiesPerThread = aRowIterations * 4;
+  constexpr uint bCopiesPerThread = (BK + rowStrideB - 1) / rowStrideB;
+
+  // The current K12 configuration has exactly BK scheduling steps. Keeping
+  // one A copy per step spreads the formerly bursty async traffic over the
+  // current tile's compute loop.
+  static_assert(aCopiesPerThread == BK);
+
+  const uint aOffset = (step / 4) * rowStrideA;
+  const uint aComponent = step % 4;
+  if (innerRowA + aOffset < BM) {
+    cuda::memcpy_async(
+        &As[(innerColA * 4 + aComponent) * BM + innerRowA + aOffset],
+        &A[(innerRowA + aOffset) * K + innerColA * 4 + aComponent],
+        cuda::aligned_size_t<sizeof(float)>(sizeof(float)), barrier);
+  }
+
+  if (step < bCopiesPerThread) {
+    const uint bOffset = step * rowStrideB;
+    if (innerRowB + bOffset < BK) {
+      cuda::memcpy_async(&Bs[(innerRowB + bOffset) * BN + innerColB * 4],
+                         &B[(innerRowB + bOffset) * N + innerColB * 4],
+                         cuda::aligned_size_t<sizeof(float4)>(sizeof(float4)),
+                         barrier);
+    }
+  }
+}
+
+template <const int BM, const int BN, const int BK, const int WM, const int WN,
+          const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
+          const int TM, const int TN>
+__device__ void processFromSmemStep(
+    uint dotIdx, float *regM, float *regN, float *threadResults,
+    const float *As, const float *Bs, const uint warpRow, const uint warpCol,
+    const uint threadRowInWarp, const uint threadColInWarp) {
+  // populate registers for whole warptile
+  for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+    for (uint i = 0; i < TM; ++i) {
+      regM[wSubRowIdx * TM + i] =
+          As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
+             threadRowInWarp * TM + i];
+    }
+  }
+  for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+    for (uint i = 0; i < TN; ++i) {
+      regN[wSubColIdx * TN + i] =
+          Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
+             threadColInWarp * TN + i];
+    }
+  }
+
+  // execute warptile matmul
+  for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+    for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+      // calculate per-thread results
+      for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+          threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+                        (wSubColIdx * TN) + resIdxN] +=
+              regM[wSubRowIdx * TM + resIdxM] *
+              regN[wSubColIdx * TN + resIdxN];
+        }
+      }
+    }
+  }
+}
+
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
           const int TM, const int TN>
@@ -53,36 +131,9 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
                 const float *Bs, const uint warpRow, const uint warpCol,
                 const uint threadRowInWarp, const uint threadColInWarp) {
   for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
-    // populate registers for whole warptile
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-      for (uint i = 0; i < TM; ++i) {
-        regM[wSubRowIdx * TM + i] =
-            As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
-               threadRowInWarp * TM + i];
-      }
-    }
-    for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-      for (uint i = 0; i < TN; ++i) {
-        regN[wSubColIdx * TN + i] =
-            Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
-               threadColInWarp * TN + i];
-      }
-    }
-
-    // execute warptile matmul
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-      for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-        // calculate per-thread results
-        for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-          for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-            threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
-                          (wSubColIdx * TN) + resIdxN] +=
-                regM[wSubRowIdx * TM + resIdxM] *
-                regN[wSubColIdx * TN + resIdxN];
-          }
-        }
-      }
-    }
+    processFromSmemStep<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
+                        TN>(dotIdx, regM, regN, threadResults, As, Bs, warpRow,
+                            warpCol, threadRowInWarp, threadColInWarp);
   }
 }
 
@@ -168,18 +219,36 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   // outer-most loop over block tiles
   for (uint bkIdx = 0; bkIdx < K - BK; bkIdx += BK) {
-    // double-buffering: load next blocktile into SMEM
+#if SGEMM_K12_PACED_ASYNC
+    // Wait only for the current tile. While computing it, issue the next
+    // tile's async copies gradually instead of flooding MIO in one burst.
+    (*frontBarrierPtr).arrive_and_wait();
+    for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+      loadFromGmemStep<BM, BN, BK, rowStrideA, rowStrideB>(
+          dotIdx, N, K, A + BK, B + BK * N,
+          As + (1 - As_offset) * BM * BK,
+          Bs + (1 - Bs_offset) * BK * BN, innerRowA, innerColA, innerRowB,
+          innerColB, (*backBarrierPtr));
+      processFromSmemStep<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN,
+                          TM, TN>(
+          dotIdx, regM, regN, threadResults, As + As_offset * BM * BK,
+          Bs + Bs_offset * BK * BN, warpRow, warpCol, threadRowInWarp,
+          threadColInWarp);
+    }
+#else
+    // Original K12 schedule: enqueue the next tile, then compute the current
+    // tile while the asynchronous copies are in flight.
     loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
         N, K, A + BK, B + BK * N, As + (1 - As_offset) * BM * BK,
         Bs + (1 - Bs_offset) * BK * BN, innerRowA, innerColA, innerRowB,
         innerColB, (*backBarrierPtr));
 
-    // compute the current blocktile
     (*frontBarrierPtr).arrive_and_wait();
     processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
         regM, regN, threadResults, As + As_offset * BM * BK,
         Bs + Bs_offset * BK * BN, warpRow, warpCol, threadRowInWarp,
         threadColInWarp);
+#endif
     A += BK;     // move BK columns to right
     B += BK * N; // move BK rows down
 

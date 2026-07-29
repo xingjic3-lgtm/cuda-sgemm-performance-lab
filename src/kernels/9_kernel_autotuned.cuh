@@ -7,6 +7,10 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+
+// 解决BK=8太小计算得少要频繁搬运计算的问题，使用BK=16，然后改进搬运代码搬多次，一次计算更多的BK
+
+
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 const int K9_NUM_THREADS = 256;
 

@@ -1,11 +1,16 @@
 #pragma once
 
+#ifdef _MSC_VER
+using uint = unsigned int;
+#endif
+
 #include "kernels/10_kernel_warptiling.cuh"
 #include "kernels/11_kernel_double_buffering.cuh"
 #include "kernels/12_kernel_double_buffering.cuh"
 #include "kernels/1_naive.cuh"
 #include "kernels/2_kernel_global_mem_coalesce.cuh"
 #include "kernels/3_kernel_shared_mem_blocking.cuh"
+#include "kernels/3b_kernel_shared_mem_b_only.cuh"
 #include "kernels/4_kernel_1D_blocktiling.cuh"
 #include "kernels/5_kernel_2D_blocktiling.cuh"
 #include "kernels/6_kernel_vectorize.cuh"

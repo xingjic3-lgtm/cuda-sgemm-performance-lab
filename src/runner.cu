@@ -1,9 +1,70 @@
+#include "dispatch.cuh"
 #include "kernels.cuh"
 #include "runner.cuh"
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+
+// Kernel 10 autotuning parameters.
+// Override them at compile time, for example:
+//   -DSGEMM_K10_BM=64 -DSGEMM_K10_BN=128
+#ifndef SGEMM_K10_NUM_THREADS
+#define SGEMM_K10_NUM_THREADS 128
+#endif
+#ifndef SGEMM_K10_BN
+#define SGEMM_K10_BN 128
+#endif
+#ifndef SGEMM_K10_BM
+#define SGEMM_K10_BM 128
+#endif
+#ifndef SGEMM_K10_BK
+#define SGEMM_K10_BK 16
+#endif
+#ifndef SGEMM_K10_WN
+#define SGEMM_K10_WN 64
+#endif
+#ifndef SGEMM_K10_WM
+#define SGEMM_K10_WM 64
+#endif
+#ifndef SGEMM_K10_WNITER
+#define SGEMM_K10_WNITER 4
+#endif
+#ifndef SGEMM_K10_TN
+#define SGEMM_K10_TN 4
+#endif
+#ifndef SGEMM_K10_TM
+#define SGEMM_K10_TM 8
+#endif
+
+// Kernel 11 defaults preserve its original A6000 configuration.
+#ifndef SGEMM_K11_NUM_THREADS
+#define SGEMM_K11_NUM_THREADS 256
+#endif
+#ifndef SGEMM_K11_BN
+#define SGEMM_K11_BN 256
+#endif
+#ifndef SGEMM_K11_BM
+#define SGEMM_K11_BM 128
+#endif
+#ifndef SGEMM_K11_BK
+#define SGEMM_K11_BK 16
+#endif
+#ifndef SGEMM_K11_WN
+#define SGEMM_K11_WN 32
+#endif
+#ifndef SGEMM_K11_WM
+#define SGEMM_K11_WM 128
+#endif
+#ifndef SGEMM_K11_WNITER
+#define SGEMM_K11_WNITER 1
+#endif
+#ifndef SGEMM_K11_TN
+#define SGEMM_K11_TN 8
+#endif
+#ifndef SGEMM_K11_TM
+#define SGEMM_K11_TM 8
+#endif
 
 float get_sec() {
   struct timeval time;
@@ -103,13 +164,21 @@ void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
 }
 
 bool verify_matrix(float *matRef, float *matOut, int N) {
-  double diff = 0.0;
-  int i;
-  for (i = 0; i < N; i++) {
-    diff = std::fabs(matRef[i] - matOut[i]);
-    if (isnan(diff) || diff > 0.01) {
-      printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
-             matRef[i], matOut[i], diff, i);
+  constexpr double absoluteTolerance = 1.0e-2;
+  constexpr double relativeTolerance = 1.0e-5;
+
+  for (int i = 0; i < N; i++) {
+    const double reference = static_cast<double>(matRef[i]);
+    const double output = static_cast<double>(matOut[i]);
+    const double diff = std::fabs(reference - output);
+    const double allowedError =
+        absoluteTolerance + relativeTolerance * std::fabs(reference);
+
+    if (!std::isfinite(reference) || !std::isfinite(output) ||
+        diff > allowedError) {
+      printf("Divergence! Should %.8g, Is %.8g, Diff %.8g, Allowed %.8g at "
+             "%d\n",
+             reference, output, diff, allowedError, i);
       return false;
     }
   }
@@ -175,6 +244,17 @@ void run_sgemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
                        cudaFuncAttributePreferredSharedMemoryCarveout,
                        cudaSharedmemCarveoutMaxShared);
   sgemm_shared_mem_block<32>
+      <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+}
+
+void run_sgemm_shared_mem_b_only(int M, int N, int K, float alpha, float *A,
+                                 float *B, float beta, float *C) {
+  dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
+  dim3 blockDim(32 * 32);
+  cudaFuncSetAttribute(sgemm_shared_mem_b_only<32>,
+                       cudaFuncAttributePreferredSharedMemoryCarveout,
+                       cudaSharedmemCarveoutMaxShared);
+  sgemm_shared_mem_b_only<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
@@ -328,65 +408,87 @@ void runSgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
-                        float beta, float *C) {
-  // Settings for A100
-  // const uint K10_NUM_THREADS = 128;
-  // const uint K10_BN = 128;
-  // const uint K10_BM = 64;
-  // const uint K10_BK = 16;
-  // const uint K10_WN = 64;
-  // const uint K10_WM = 32;
-  // const uint K10_WNITER = 1;
-  // const uint K10_TN = 4;
-  // const uint K10_TM = 4;
-  // Settings for A6000
-  const uint K10_NUM_THREADS = 128;
-  const uint K10_BN = 128;
-  const uint K10_BM = 128;
-  const uint K10_BK = 16;
-  const uint K10_WN = 64;
-  const uint K10_WM = 64;
-  const uint K10_WNITER = 4;
-  const uint K10_TN = 4;
-  const uint K10_TM = 8;
-  dim3 blockDim(K10_NUM_THREADS);
+template <const int NUM_THREADS, const int BM, const int BN, const int BK,
+          const int WM, const int WN, const int WNITER, const int TM,
+          const int TN>
+void launchSgemmWarptilingConfig(int M, int N, int K, float alpha, float *A,
+                                 float *B, float beta, float *C) {
+  dim3 blockDim(NUM_THREADS);
 
-  constexpr uint NUM_WARPS = K10_NUM_THREADS / 32;
+  constexpr int NUM_WARPS = NUM_THREADS / 32;
 
   // warptile in threadblocktile
-  static_assert((K10_BN % K10_WN == 0) and (K10_BM % K10_WM == 0));
-  static_assert((K10_BN / K10_WN) * (K10_BM / K10_WM) == NUM_WARPS);
+  static_assert((BN % WN == 0) and (BM % WM == 0));
+  static_assert((BN / WN) * (BM / WM) == NUM_WARPS);
 
   // threads in warpsubtile
-  static_assert((K10_WM * K10_WN) % (WARPSIZE * K10_TM * K10_TN * K10_WNITER) ==
-                0);
-  constexpr uint K10_WMITER =
-      (K10_WM * K10_WN) / (32 * K10_TM * K10_TN * K10_WNITER);
+  static_assert((WM * WN) % (WARPSIZE * TM * TN * WNITER) == 0);
+  constexpr int WMITER = (WM * WN) / (32 * TM * TN * WNITER);
   // warpsubtile in warptile
-  static_assert((K10_WM % K10_WMITER == 0) and (K10_WN % K10_WNITER == 0));
+  static_assert((WM % WMITER == 0) and (WN % WNITER == 0));
 
-  static_assert((K10_NUM_THREADS * 4) % K10_BK == 0,
+  static_assert((NUM_THREADS * 4) % BK == 0,
                 "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
                 "issues during GMEM->SMEM tiling (loading only parts of the "
                 "final row of Bs during each iteraion)");
-  static_assert((K10_NUM_THREADS * 4) % K10_BN == 0,
+  static_assert((NUM_THREADS * 4) % BN == 0,
                 "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
                 "issues during GMEM->SMEM tiling (loading only parts of the "
                 "final row of As during each iteration)");
-  static_assert(K10_BN % (16 * K10_TN) == 0,
+  static_assert(BN % (16 * TN) == 0,
                 "BN must be a multiple of 16*TN to avoid quantization effects");
-  static_assert(K10_BM % (16 * K10_TM) == 0,
+  static_assert(BM % (16 * TM) == 0,
                 "BM must be a multiple of 16*TM to avoid quantization effects");
-  static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
+  static_assert((BM * BK) % (4 * NUM_THREADS) == 0,
                 "BM*BK must be a multiple of 4*256 to vectorize loads");
-  static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
+  static_assert((BN * BK) % (4 * NUM_THREADS) == 0,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
-  dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
-  sgemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
-                  K10_TN, K10_NUM_THREADS>
-      <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+  const bool needsBoundsCheck =
+      (M % BM != 0) || (N % BN != 0) || (K % BK != 0);
+  if (needsBoundsCheck) {
+    sgemmWarptiling<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS, true>
+        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  } else {
+    sgemmWarptiling<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS, false>
+        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  }
+}
+
+void runSgemmAuto(int M, int N, int K, float alpha, float *A, float *B,
+                  float beta, float *C) {
+  // Every case names a separate compile-time specialization. Runtime dispatch
+  // selects an entry point; it does not mutate template parameters.
+  switch (selectK10Config(M, N, K)) {
+  case K10ConfigId::Config29:
+    // threads, BM, BN, BK, WM, WN, WNITER, TM, TN
+    launchSgemmWarptilingConfig<256, 128, 64, 32, 32, 32, 1, 8, 4>(
+        M, N, K, alpha, A, B, beta, C);
+    return;
+  case K10ConfigId::Config11:
+    launchSgemmWarptilingConfig<256, 128, 64, 32, 32, 32, 1, 4, 4>(
+        M, N, K, alpha, A, B, beta, C);
+    return;
+  case K10ConfigId::Config38:
+    launchSgemmWarptilingConfig<256, 128, 128, 16, 64, 32, 2, 4, 8>(
+        M, N, K, alpha, A, B, beta, C);
+    return;
+  case K10ConfigId::Config5:
+    launchSgemmWarptilingConfig<128, 128, 128, 16, 32, 128, 4, 8, 4>(
+        M, N, K, alpha, A, B, beta, C);
+    return;
+  case K10ConfigId::Config21:
+    launchSgemmWarptilingConfig<128, 128, 128, 16, 128, 32, 2, 4, 8>(
+        M, N, K, alpha, A, B, beta, C);
+    return;
+  case K10ConfigId::GeneralFallback:
+    // Original Kernel 10 configuration, already used by the arbitrary-shape
+    // bounds-checking path before phase-three square-only tuning.
+    launchSgemmWarptilingConfig<128, 128, 128, 16, 64, 64, 4, 8, 4>(
+        M, N, K, alpha, A, B, beta, C);
+    return;
+  }
 }
 
 void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
@@ -401,19 +503,33 @@ void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
   // const uint K11_WNITER = 2;
   // const uint K11_TN = 4;
   // const uint K11_TM = 4;
-  // Settings for A6000
-  const uint K11_NUM_THREADS = 256;
-  const uint K11_BN = 256;
-  const uint K11_BM = 128;
-  const uint K11_BK = 16;
-  const uint K11_WN = 32;
-  const uint K11_WM = 128;
-  const uint K11_WNITER = 1;
-  const uint K11_TN = 8;
-  const uint K11_TM = 8;
+  constexpr uint K11_NUM_THREADS = SGEMM_K11_NUM_THREADS;
+  constexpr uint K11_BN = SGEMM_K11_BN;
+  constexpr uint K11_BM = SGEMM_K11_BM;
+  constexpr uint K11_BK = SGEMM_K11_BK;
+  constexpr uint K11_WN = SGEMM_K11_WN;
+  constexpr uint K11_WM = SGEMM_K11_WM;
+  constexpr uint K11_WNITER = SGEMM_K11_WNITER;
+  constexpr uint K11_TN = SGEMM_K11_TN;
+  constexpr uint K11_TM = SGEMM_K11_TM;
   dim3 blockDim(K11_NUM_THREADS);
 
   constexpr uint NUM_WARPS = K11_NUM_THREADS / 32;
+#if SGEMM_K11_SPLIT_THREE_TO_ONE
+  constexpr uint K11_GROUP0_THREADS = (K11_NUM_THREADS * 3) / 4;
+#else
+  constexpr uint K11_GROUP0_THREADS = K11_NUM_THREADS / 2;
+#endif
+  constexpr uint K11_GROUP1_THREADS =
+      K11_NUM_THREADS - K11_GROUP0_THREADS;
+  static_assert(K11_GROUP0_THREADS % WARPSIZE == 0 &&
+                    K11_GROUP1_THREADS % WARPSIZE == 0,
+                "K11 split must divide the block on warp boundaries");
+  static_assert(K11_GROUP0_THREADS >= K11_BK / 4 &&
+                    K11_GROUP1_THREADS >= K11_BK / 4 &&
+                    K11_GROUP0_THREADS >= K11_BN / 4 &&
+                    K11_GROUP1_THREADS >= K11_BN / 4,
+                "Each K11 group must contain enough threads to load a tile");
 
   // warptile in threadblocktile
   static_assert((K11_BN % K11_WN == 0) and (K11_BM % K11_WM == 0));
@@ -427,22 +543,10 @@ void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
   // warpsubtile in warptile
   static_assert((K11_WM % K11_WMITER == 0) and (K11_WN % K11_WNITER == 0));
 
-  static_assert((K11_NUM_THREADS / 2 * 4) % K11_BK == 0,
-                "NUM_THREADS*4 must be multiple of BK to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of Bs during each iteraion)");
-  static_assert((K11_NUM_THREADS / 2 * 4) % K11_BN == 0,
-                "NUM_THREADS*4 must be multiple of BN to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of As during each iteration)");
   static_assert(K11_BN % (16 * K11_TN) == 0,
                 "BN must be a multiple of 16*TN to avoid quantization effects");
   static_assert(K11_BM % (16 * K11_TM) == 0,
                 "BM must be a multiple of 16*TM to avoid quantization effects");
-  static_assert((K11_BM * K11_BK) % (4 * K11_NUM_THREADS / 2) == 0,
-                "BM*BK must be a multiple of 4*256 to vectorize loads");
-  static_assert((K11_BN * K11_BK) % (4 * K11_NUM_THREADS / 2) == 0,
-                "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K11_BN), CEIL_DIV(M, K11_BM));
   sgemmDoubleBuffering<K11_BM, K11_BN, K11_BK, K11_WM, K11_WN, K11_WNITER,
@@ -535,13 +639,23 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     runSgemmAutotuned(M, N, K, alpha, A, B, beta, C);
     break;
   case 10:
-    runSgemmWarptiling(M, N, K, alpha, A, B, beta, C);
+#ifdef SGEMM_K10_AUTOTUNE_MODE
+    launchSgemmWarptilingConfig<
+        SGEMM_K10_NUM_THREADS, SGEMM_K10_BM, SGEMM_K10_BN, SGEMM_K10_BK,
+        SGEMM_K10_WM, SGEMM_K10_WN, SGEMM_K10_WNITER, SGEMM_K10_TM,
+        SGEMM_K10_TN>(M, N, K, alpha, A, B, beta, C);
+#else
+    runSgemmAuto(M, N, K, alpha, A, B, beta, C);
+#endif
     break;
   case 11:
     runSgemmDoubleBuffering(M, N, K, alpha, A, B, beta, C);
     break;
   case 12:
     runSgemmDoubleBuffering2(M, N, K, alpha, A, B, beta, C);
+    break;
+  case 13:
+    run_sgemm_shared_mem_b_only(M, N, K, alpha, A, B, beta, C);
     break;
   default:
     throw std::invalid_argument("Unknown kernel number");

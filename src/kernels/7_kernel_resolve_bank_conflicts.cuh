@@ -9,6 +9,11 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+// 已经理解kernel7的理论  就是当计算任务多时，假设计算C的64列，TM=8，那么一个thread中就连续计算8次且这8个数据是连续存储在bank上的，如果bank32，
+// 那么8个thread中thread0要计算的8个数据在bank0-7 thread1要计算的8个数据在8-15.......但是在同一时刻它们只会读bank0，8，...，此时thread4-thread7也要读bank0,8,...，
+// 但是其它的bamk比如1-7是可读的，这就导致了bankconflict
+
+
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void sgemmResolveBankConflicts(int M, int N, int K, float alpha,
                                           float *A, float *B, float beta,
@@ -52,7 +57,8 @@ __global__ void sgemmResolveBankConflicts(int M, int N, int K, float alpha,
     As[(innerColA * 4 + 2) * BM + innerRowA] = tmp.z;
     As[(innerColA * 4 + 3) * BM + innerRowA] = tmp.w;
 
-    // "linearize" Bs while storing it
+    // "linearize" Bs while storing it     这里的[((innerColB % 2) * 4 + innerRowB * 8 + 0) * 16 + innerColB / 2]直接用最下面的
+    // // 新 row = k * 8 + (4g + 0) % 8 和 // 新 col = (4g + 0) / 8 回代就得到这个式子
     tmp = reinterpret_cast<float4 *>(&B[innerRowB * N + innerColB * 4])[0];
     Bs[((innerColB % 2) * 4 + innerRowB * 8 + 0) * 16 + innerColB / 2] = tmp.x;
     Bs[((innerColB % 2) * 4 + innerRowB * 8 + 1) * 16 + innerColB / 2] = tmp.y;
@@ -101,3 +107,45 @@ __global__ void sgemmResolveBankConflicts(int M, int N, int K, float alpha,
     }
   }
 }
+
+
+// 目标：
+// 第 0 拍会读的放一行：
+// B0 B8 B16 B24 B32 ...
+
+// 第 1 拍会读的放一行：
+// B1 B9 B17 B25 B33 ...
+
+// 第 2 拍会读的放一行：
+// B2 B10 B18 B26 B34 ...
+// 现在看 kernel7 的索引为什么刚好做到这件事。
+
+// 这一行代码正在处理一个 float4：
+// tmp = B[innerRowB][innerColB * 4 ... innerColB * 4 + 3]
+// 也就是：
+// innerRowB = k
+// innerColB = g
+
+// tmp.x = B[k][4g + 0]
+// tmp.y = B[k][4g + 1]
+// tmp.z = B[k][4g + 2]
+// tmp.w = B[k][4g + 3]
+// 我们现在只看 tmp.x。
+// 它原来是：
+// B[k][4g + 0]
+// 它应该被放到哪里？
+// 因为我们想按“第几拍”排，所以：
+// B[k][0]  应该放到第 0 拍那行
+// B[k][1]  应该放到第 1 拍那行
+// ...
+// B[k][7]  应该放到第 7 拍那行
+// B[k][8]  又回到第 0 拍那行
+// B[k][9]  又回到第 1 拍那行
+// 所以对任意 B[k][n]：
+// 新 row = k * 8 + n % 8
+// 新 col = n / 8
+// 这里 8 来自 TN=8。
+// 现在把 tmp.x 的 n = 4g + 0 代进去：
+// 新 row = k * 8 + (4g + 0) % 8
+// 新 col = (4g + 0) / 8
+//

@@ -9,6 +9,9 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+
+// (&A[innerRowA * K + innerColA * 4])[0];用float4让load次数变少，减少硬件地址计算次数和load次数（一次事务）加快速度。
+
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
                                float *B, float beta, float *C) {

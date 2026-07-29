@@ -8,6 +8,23 @@
 #include <cuda_runtime.h>
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+// 有两张计划表，一张是读数据把数据端上桌的计划，一张是计算数据的计划。都是用的同一组thread
+// 端数据上桌的算法：thread个数是num，A需要搬的数据是BK*BM，B需要搬的数据是BK*BN，那么A要搬的次数是BK*BM/num，B要搬的次数是BK*BN/num。
+// 对A：代码中的算法是用thread个数num/BK算总thread能搬几行，这就是stride，搬几个stride就可以搬完了  对B：同理不过是num/BN了
+
+
+// 本节主要是把kernel4的B的列复用升级为A的行复用和B的列复用同时做，做法就是thread计算C的多个元素C00，C01      C10，C11（示意）
+// 算法：一个idx就是A的一个列，B的一个行，依据BK和idx递增算出，主要思想就是A00*B00，A00*B01，A10*B00，A10*B01
+
+
+// 定性kernel5的size128速度慢于前面的kernel的原因
+// Kernel 5 在小矩阵上性能低，主要原因是 tile 太大导致 grid 中 block 数太少，GPU 并行计算资源没有被充分占用。
+// aigc：
+// Kernel 5 使用较大的 C tile，例如 BM=128, BN=128。
+// 当矩阵 size=128 时，整个 GEMM 只有 1 个 block；
+// size=256 时只有 4 个 block。
+// block 数太少，无法填满 GPU 上的多个 SM，导致 occupancy/SM utilization 很低。
+// 因此虽然每个 thread 的计算复用更高，但整体并行度不足，GFLOPS 反而低。
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)

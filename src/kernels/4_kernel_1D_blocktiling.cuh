@@ -9,6 +9,10 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+
+// 优化从sharedmemory->thread这条线  但是kernel4只优化了B的复用,也就是一个thread用同一列去与多个A的行进行计算
+// C02、C12、C22、C32是连续的，都要用到B的第二列多次加载B进thread浪费，于是干脆在一个thread中计算C的多个元素，B的列在thread内复用
+// kernel5优化为一个thread复用多列B和多行A
 template <const int BM, const int BN, const int BK, const int TM>
 __global__ void sgemm1DBlocktiling(int M, int N, int K, float alpha,
                                    const float *A, const float *B, float beta,

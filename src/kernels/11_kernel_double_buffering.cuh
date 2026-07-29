@@ -9,6 +9,33 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+#ifndef SGEMM_K11_DIAGNOSTIC_SEQUENTIAL
+#define SGEMM_K11_DIAGNOSTIC_SEQUENTIAL 0
+#endif
+
+#ifndef SGEMM_K11_SPLIT_THREE_TO_ONE
+#define SGEMM_K11_SPLIT_THREE_TO_ONE 0
+#endif
+
+
+// 计算
+
+// 串行:   kernel10及以前   时长占用=load+compute+load+compute+load+compute+.........
+// [ load ][ compute ][ load ][ compute ]
+
+// 重叠:   kernel11         时长占用=firstload+max(load,compute)+max(load,compute)+max(load,compute)+.........
+// [ load0 ]
+//         [ compute0 ]
+//         [ load1    ]
+//                     [ compute1 ]
+//                     [ load2    ]
+//
+
+// 本节模型：kernel11的模型是一次只算半个Ctile，因为是手动实现，kernel12更像上面这个思维模型，上面这个简单一点
+// group0: [ compute0_part0 ] [ compute1_part0 ] [ load2        ]
+// group1: [ load1          ] [ compute0_part1 ] [ compute1_part1 ]
+
+
 namespace db {
 
 template <const int BM, const int BN, const int BK, const int rowStrideA,
@@ -17,7 +44,7 @@ __device__ void loadFromGmem(const int N, const int K, float *A, float *B,
                              float *As, float *Bs, const int innerRowA,
                              const int innerColA, const int innerRowB,
                              const int innerColB) {
-  for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
+  for (uint offset = 0; innerRowA + offset < BM; offset += rowStrideA) {
     float4 tmp = reinterpret_cast<float4 *>(
         &A[(innerRowA + offset) * K + innerColA * 4])[0];
     // transpose A while storing it
@@ -27,7 +54,7 @@ __device__ void loadFromGmem(const int N, const int K, float *A, float *B,
     As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
   }
 
-  for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
+  for (uint offset = 0; innerRowB + offset < BK; offset += rowStrideB) {
     reinterpret_cast<float4 *>(
         &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
         reinterpret_cast<float4 *>(
@@ -106,8 +133,19 @@ __global__ void __launch_bounds__(NUM_THREADS)
   __shared__ float As[2 * BM * BK];
   __shared__ float Bs[2 * BK * BN];
 
-  // setup double buffering split
-  bool doubleBufferIdx = threadIdx.x >= (NUM_THREADS / 2);
+#if SGEMM_K11_SPLIT_THREE_TO_ONE
+  // Rejected experiment: three quarters compute while one quarter loads.
+  constexpr uint GROUP0_THREADS = (NUM_THREADS * 3) / 4;
+#else
+  // Stable baseline: split the block evenly on warp boundaries.
+  constexpr uint GROUP0_THREADS = NUM_THREADS / 2;
+#endif
+  constexpr uint GROUP1_THREADS = NUM_THREADS - GROUP0_THREADS;
+  static_assert(GROUP0_THREADS % WARPSIZE == 0);
+  static_assert(GROUP1_THREADS % WARPSIZE == 0);
+  static_assert(GROUP0_THREADS >= BK / 4 && GROUP1_THREADS >= BK / 4);
+  static_assert(GROUP0_THREADS >= BN / 4 && GROUP1_THREADS >= BN / 4);
+  bool doubleBufferIdx = threadIdx.x >= GROUP0_THREADS;
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
@@ -115,15 +153,33 @@ __global__ void __launch_bounds__(NUM_THREADS)
   // Move C_ptr to warp's output tile
   C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
 
-  // calculating the indices that this thread will load into SMEM
-  // for the loading, we're pretending like there's half as many threads
-  // as there actually are
-  const uint innerRowA = (threadIdx.x % (NUM_THREADS / 2)) / (BK / 4);
-  const uint innerColA = (threadIdx.x % (NUM_THREADS / 2)) % (BK / 4);
-  constexpr uint rowStrideA = ((NUM_THREADS / 2) * 4) / BK;
-  const uint innerRowB = (threadIdx.x % (NUM_THREADS / 2)) / (BN / 4);
-  const uint innerColB = (threadIdx.x % (NUM_THREADS / 2)) % (BN / 4);
-  constexpr uint rowStrideB = (NUM_THREADS / 2) / (BN / 4);
+#if SGEMM_K11_DIAGNOSTIC_SEQUENTIAL
+  // Diagnostic mode: all threads cooperatively load each tile.
+  const uint innerRowA = threadIdx.x / (BK / 4);
+  const uint innerColA = threadIdx.x % (BK / 4);
+  constexpr uint rowStrideA = (NUM_THREADS * 4) / BK;
+  const uint innerRowB = threadIdx.x / (BN / 4);
+  const uint innerColB = threadIdx.x % (BN / 4);
+  constexpr uint rowStrideB = NUM_THREADS / (BN / 4);
+#else
+  // Each group must still be able to load a complete A/B tile by itself.
+  const uint group0ThreadIdx = threadIdx.x;
+  const uint group0InnerRowA = group0ThreadIdx / (BK / 4);
+  const uint group0InnerColA = group0ThreadIdx % (BK / 4);
+  constexpr uint group0RowStrideA = (GROUP0_THREADS * 4) / BK;
+  const uint group0InnerRowB = group0ThreadIdx / (BN / 4);
+  const uint group0InnerColB = group0ThreadIdx % (BN / 4);
+  constexpr uint group0RowStrideB = GROUP0_THREADS / (BN / 4);
+
+  const uint group1ThreadIdx =
+      threadIdx.x >= GROUP0_THREADS ? threadIdx.x - GROUP0_THREADS : 0;
+  const uint group1InnerRowA = group1ThreadIdx / (BK / 4);
+  const uint group1InnerColA = group1ThreadIdx % (BK / 4);
+  constexpr uint group1RowStrideA = (GROUP1_THREADS * 4) / BK;
+  const uint group1InnerRowB = group1ThreadIdx / (BN / 4);
+  const uint group1InnerColB = group1ThreadIdx % (BN / 4);
+  constexpr uint group1RowStrideB = GROUP1_THREADS / (BN / 4);
+#endif
 
   // allocate thread-local cache for results in registerfile
   float threadResults[WMITER * TM * WNITER * TN] = {0.0};
@@ -131,10 +187,25 @@ __global__ void __launch_bounds__(NUM_THREADS)
   float regM[WMITER * TM] = {0.0};
   float regN[WNITER * TN] = {0.0};
 
-  if (doubleBufferIdx == 0) {
-    // load first (B0)
+#if SGEMM_K11_DIAGNOSTIC_SEQUENTIAL
+  // Keep K11's 32 KB shared-memory allocation, but remove the split schedule.
+  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
     db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
         N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
+    __syncthreads();
+    db::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
+                        TN>(regM, regN, threadResults, As, Bs, warpRow, warpCol,
+                            threadRowInWarp, threadColInWarp);
+    A += BK;
+    B += BK * N;
+    __syncthreads();
+  }
+#else
+  if (doubleBufferIdx == 0) {
+    // load first (B0)
+    db::loadFromGmem<BM, BN, BK, group0RowStrideA, group0RowStrideB>(
+        N, K, A, B, As, Bs, group0InnerRowA, group0InnerColA, group0InnerRowB,
+        group0InnerColB);
   }
   __syncthreads();
 
@@ -158,16 +229,16 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
       // load current + 2 (B0)
       if (bkIdx + 2 * BK < K) {
-        db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-            N, K, A + 2 * BK, B + 2 * BK * N, As, Bs, innerRowA, innerColA,
-            innerRowB, innerColB);
+        db::loadFromGmem<BM, BN, BK, group0RowStrideA, group0RowStrideB>(
+            N, K, A + 2 * BK, B + 2 * BK * N, As, Bs, group0InnerRowA,
+            group0InnerColA, group0InnerRowB, group0InnerColB);
       }
     } else {
       // load current + 1 (B1)
       if (bkIdx + BK < K) {
-        db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-            N, K, A + BK, B + BK * N, As + (BM * BK), Bs + (BK * BN), innerRowA,
-            innerColA, innerRowB, innerColB);
+        db::loadFromGmem<BM, BN, BK, group1RowStrideA, group1RowStrideB>(
+            N, K, A + BK, B + BK * N, As + (BM * BK), Bs + (BK * BN),
+            group1InnerRowA, group1InnerColA, group1InnerRowB, group1InnerColB);
       }
       __syncthreads();
 
@@ -190,6 +261,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     B += 2 * BK * N; // move BK rows down
     __syncthreads();
   }
+#endif
 
   // write out the results
   for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {

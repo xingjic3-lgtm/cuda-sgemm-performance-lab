@@ -10,15 +10,73 @@
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 const int WARPSIZE = 32; // warpSize is not constexpr
 
+// 之前的kernel都是站在block角度分配任务，然后直接顺序用thread引起了p1的情况   （在用线程对应计算任务的时候直接用row和col，导致顺序进行）
+// 当我们把连续32个thread当成一个warp看的时候它的读取像下面这样，每个warp都读128列B，B在多个warp中读复用率低，复用率低的情况
+// sharedload就多，那么肯定速率就有影响，kernel10从warp的视角将一个block的任务分配成p2，这样warp间的读取不会过多地重复读减少了sharedload次数，提高B的复用率速度更快
+// 这种方法因为是指定的一个warp的固定任务，在形状上可能不适配，一个warp一次计算不完我们指定的64*64的任务，引入subwarp用for循环多次执行，如p3
+// +------------------------------------------------+
+// | warp0: 16 x 128                                |        这个warp是我们从拿连续32个thread组成的一个warp的视角的，任务数是由thread决定
+// +------------------------------------------------+
+// | warp1: 16 x 128                                |
+// +------------------------------------------------+
+// | warp2: 16 x 128                                |
+// +------------------------------------------------+
+// | warp3: 16 x 128                                |
+// +------------------------------------------------+
+// | warp4: 16 x 128                                |
+// +------------------------------------------------+
+// | warp5: 16 x 128                                |
+// +------------------------------------------------+
+
+// +------------------------+------------------------+
+// | warp0: 64 x 64         | warp1: 64 x 64         |       这个warp的任务数是我们指定的，与thread无关所以可能出现一个warp一次性算不完的情况，于是引入了subwarp
+// |                        |                        |
+// +------------------------+------------------------+
+// | warp2: 64 x 64         | warp3: 64 x 64         |
+// |                        |                        |
+// +------------------------+------------------------+
+
+// +----------------+----------------+----------------+----------------+
+// | 64 x 16        | 64 x 16        | 64 x 16        | 64 x 16        |
+// | wSubColIdx=0   | wSubColIdx=1   | wSubColIdx=2   | wSubColIdx=3   |
+// +----------------+----------------+----------------+----------------+
+
+
+// 在warp视角下进行一个block的任务计算  1.如何制定一个warp要计算的任务尺寸，安排方块形，从而增加复用率减少sharedload，进而提升性能
+//  2.一个warp一次计算不完指定的一块任务时，用subwarp＋WMIter和WNIter来分割任务
+
+
+// 看得出来之前的玩法一个block加载A时没有重复加载B时就会加载8次，7次都是多余的，而kernel10只会加载B两次加载A两次，AB各重复一次
+
 namespace wt {
 template <const int BM, const int BN, const int BK, const int rowStrideA,
-          const int rowStrideB>
-__device__ void loadFromGmem(int N, int K, const float *A, const float *B,
-                             float *As, float *Bs, int innerRowA, int innerColA,
-                             int innerRowB, int innerColB) {
+          const int rowStrideB, bool CHECK_BOUNDS>
+__device__ void loadFromGmem(int M, int N, int K, const float *A,
+                             const float *B, float *As, float *Bs,
+                             int blockRow, int blockCol, int bkIdx,
+                             int innerRowA, int innerColA, int innerRowB,
+                             int innerColB) {
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
-    const float4 tmp = reinterpret_cast<const float4 *>(
-        &A[(innerRowA + offset) * K + innerColA * 4])[0];
+    float4 tmp;
+    if (CHECK_BOUNDS) {
+      const int globalRow = blockRow + innerRowA + offset;
+      const int globalCol = bkIdx + innerColA * 4;
+      tmp.x = (globalRow < M && globalCol + 0 < K)
+                  ? A[(innerRowA + offset) * K + innerColA * 4 + 0]
+                  : 0.0F;
+      tmp.y = (globalRow < M && globalCol + 1 < K)
+                  ? A[(innerRowA + offset) * K + innerColA * 4 + 1]
+                  : 0.0F;
+      tmp.z = (globalRow < M && globalCol + 2 < K)
+                  ? A[(innerRowA + offset) * K + innerColA * 4 + 2]
+                  : 0.0F;
+      tmp.w = (globalRow < M && globalCol + 3 < K)
+                  ? A[(innerRowA + offset) * K + innerColA * 4 + 3]
+                  : 0.0F;
+    } else {
+      tmp = reinterpret_cast<const float4 *>(
+          &A[(innerRowA + offset) * K + innerColA * 4])[0];
+    }
     // float4 tmp;
     // asm("ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
     //     : "=f"(tmp.x), "=f"(tmp.y), "=f"(tmp.z), "=f"(tmp.w)
@@ -30,10 +88,31 @@ __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
   }
 
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
-    reinterpret_cast<float4 *>(
-        &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
-        reinterpret_cast<const float4 *>(
-            &B[(innerRowB + offset) * N + innerColB * 4])[0];
+    if (CHECK_BOUNDS) {
+      const int globalRow = bkIdx + innerRowB + offset;
+      const int globalCol = blockCol + innerColB * 4;
+      Bs[(innerRowB + offset) * BN + innerColB * 4 + 0] =
+          (globalRow < K && globalCol + 0 < N)
+              ? B[(innerRowB + offset) * N + innerColB * 4 + 0]
+              : 0.0F;
+      Bs[(innerRowB + offset) * BN + innerColB * 4 + 1] =
+          (globalRow < K && globalCol + 1 < N)
+              ? B[(innerRowB + offset) * N + innerColB * 4 + 1]
+              : 0.0F;
+      Bs[(innerRowB + offset) * BN + innerColB * 4 + 2] =
+          (globalRow < K && globalCol + 2 < N)
+              ? B[(innerRowB + offset) * N + innerColB * 4 + 2]
+              : 0.0F;
+      Bs[(innerRowB + offset) * BN + innerColB * 4 + 3] =
+          (globalRow < K && globalCol + 3 < N)
+              ? B[(innerRowB + offset) * N + innerColB * 4 + 3]
+              : 0.0F;
+    } else {
+      reinterpret_cast<float4 *>(
+          &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
+          reinterpret_cast<const float4 *>(
+              &B[(innerRowB + offset) * N + innerColB * 4])[0];
+    }
     // asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
     //     : "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 0]),
     //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 1]),
@@ -98,7 +177,8 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
  * @tparam TN The per-thread tile size for N dimension.
  */
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
-          const int WNITER, const int TM, const int TN, const int NUM_THREADS>
+          const int WNITER, const int TM, const int TN, const int NUM_THREADS,
+          bool CHECK_BOUNDS>
 __global__ void __launch_bounds__(NUM_THREADS)
     sgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                     float beta, float *C) {
@@ -147,8 +227,9 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   // outer-most loop over block tiles
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    wt::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-        N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
+    wt::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB, CHECK_BOUNDS>(
+        M, N, K, A, B, As, Bs, cRow * BM, cCol * BN, bkIdx, innerRowA,
+        innerColA, innerRowB, innerColB);
     __syncthreads();
     wt::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
                         TN>(regM, regN, threadResults, As, Bs, warpRow, warpCol,
@@ -165,13 +246,31 @@ __global__ void __launch_bounds__(NUM_THREADS)
       float *C_interim = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;
       for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
         for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
+          const int globalRow = cRow * BM + warpRow * WM +
+                                wSubRowIdx * WSUBM +
+                                threadRowInWarp * TM + resIdxM;
+          const int globalCol = cCol * BN + warpCol * WN +
+                                wSubColIdx * WSUBN +
+                                threadColInWarp * TN + resIdxN;
+          const int i = (wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+                        wSubColIdx * TN + resIdxN;
+          if (CHECK_BOUNDS) {
+            if (globalRow < M) {
+              for (int lane = 0; lane < 4; ++lane) {
+                if (globalCol + lane < N) {
+                  float &c = C_interim[(threadRowInWarp * TM + resIdxM) * N +
+                                       threadColInWarp * TN + resIdxN + lane];
+                  c = alpha * threadResults[i + lane] + beta * c;
+                }
+              }
+            }
+            continue;
+          }
           // load C vector into registers
           float4 tmp = reinterpret_cast<float4 *>(
               &C_interim[(threadRowInWarp * TM + resIdxM) * N +
                          threadColInWarp * TN + resIdxN])[0];
           // perform GEMM update in reg
-          const int i = (wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
-                        wSubColIdx * TN + resIdxN;
           tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
           tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
           tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
