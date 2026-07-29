@@ -17,51 +17,19 @@ correctness validation, and Nsight Compute bottleneck analysis.
 - Used Nsight Compute and controlled experiments to explain why later
   double-buffering attempts were slower.
 
-## Kernel optimization path
-
-```mermaid
-flowchart TB
-    subgraph S1["Global memory to shared memory"]
-        direction LR
-        K1["K1 Naive<br/>one thread computes one C element"]
-        K2["K2 Coalesced access<br/>a warp reads contiguous addresses"]
-        K3["K3 Shared-memory tile<br/>a block reuses A and B tiles"]
-        K1 --> K2 --> K3
-    end
-
-    subgraph S2["More work and reuse per thread"]
-        direction LR
-        K4["K4 1D block tiling<br/>one thread computes multiple rows"]
-        K5["K5 2D block tiling<br/>one thread computes a TM x TN tile"]
-        K6["K6 Vectorized access<br/>float4 global-memory transactions"]
-        K4 --> K5 --> K6
-    end
-
-    subgraph S3["Layout and execution mapping"]
-        direction LR
-        K7["K7 Shared-memory layout<br/>reduce bank conflicts"]
-        K8["K8 Padded layout<br/>change conflicting bank mapping"]
-        K9["K9 Static tuning<br/>select stronger tile parameters"]
-        K7 --> K8 --> K9
-    end
-
-    subgraph S4["Warp scheduling and overlap"]
-        direction LR
-        K10["K10 Warp tiling<br/>config 21 selected"]
-        K11["K11 Split double buffer<br/>rejected: barrier imbalance"]
-        K12["K12 Async copy<br/>rejected: MIO and instruction cost"]
-        K10 --> K11 --> K12
-    end
-
-    K3 --> K4
-    K6 --> K7
-    K9 --> K10
-```
-
 ## Result
 
 Tested on an NVIDIA GeForce RTX 5060 Ti with FP32 `4096 x 4096 x 4096` SGEMM.
 Times below are ordinary CUDA-event measurements outside Nsight Compute.
+
+![Kernel 1-12 performance by matrix size](benchmark_results.png)
+
+K1–K9 and K11–K12 come from
+[`baseline_5060ti.csv`](reports/baseline_5060ti.csv). Each K10 point is the best
+successful configuration for that size in
+[`phase3_tuning_results.csv`](reports/phase3_tuning_results.csv). The chart's
+4096 K10 point is the Phase 3 result (15.607 TFLOP/s); the table below is the
+later Phase 5 controlled-comparison rerun (15.163 TFLOP/s).
 
 | Kernel or experiment | Time | Throughput | Decision |
 |---|---:|---:|---|

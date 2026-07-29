@@ -1,136 +1,209 @@
 #!/usr/bin/env python3
 
-import re
-import matplotlib
-import matplotlib.pyplot as plt
-import seaborn as sn
-import pandas as pd
+import argparse
+import csv
 from pathlib import Path
 
-# this makes all plots look nicer, and high dpi
-# sn.set_theme(style="whitegrid", font_scale=1.0, rc={"figure.dpi": 200})
-# set a nicer font
-# plt.rcParams["font.family"] = "serif"
-# To set some sane defaults
-matplotlib.style.use("fivethirtyeight")
-matplotlib.style.use("seaborn-v0_8-talk")
-matplotlib.rcParams["font.family"] = "monospace"
-matplotlib.rcParams["figure.dpi"] = 200
-plt.rcParams["savefig.facecolor"] = "white"
-# sn.set_context("talk")
+import matplotlib.pyplot as plt
 
+
+MATRIX_SIZES = [128, 256, 512, 1024, 2048, 4096]
 KERNEL_NAMES = {
-    0: "cuBLAS",
     1: "Naive",
-    2: "GMEM Coalescing",
-    3: "SMEM Caching",
-    4: "1D Blocktiling",
-    5: "2D Blocktiling",
-    6: "Vectorized Mem Access",
-    7: "Avoid Bank Conflicts (Linearize)",
-    8: "Avoid Bank Conflicts (Offset)",
-    9: "Autotuning",
-    10: "Warptiling",
-    11: "Double Buffering",
+    2: "GMEM coalescing",
+    3: "SMEM caching",
+    4: "1D block tiling",
+    5: "2D block tiling",
+    6: "Vectorized access",
+    7: "Bank layout",
+    8: "Padded layout",
+    9: "Static tuning",
+    10: "Warp tiling (best config/size)",
+    11: "Split double buffer",
+    12: "Async double buffer",
 }
 
 
-def parse_file(file):
-    """
-    The data we want to parse has this format:
+def load_baseline(csv_path: Path) -> dict[int, dict[int, float]]:
+    results = {kernel_id: {} for kernel_id in KERNEL_NAMES}
+    with csv_path.open(newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            kernel_id = int(row["kernel_id"])
+            size = int(row["size_m"])
+            if (
+                kernel_id in results
+                and row["status"] == "ok"
+                and size in MATRIX_SIZES
+                and int(row["size_n"]) == size
+                and int(row["size_k"]) == size
+            ):
+                results[kernel_id][size] = float(row["gflops"]) / 1000.0
+    return results
 
-    Average elapsed time: (0.005661) s, performance: (24277.4) GFLOPS. size: (4096).
-    """
-    with open(file, "r") as f:
-        lines = [line.strip() for line in f.readlines()]
 
-    data = {"size": [], "gflops": []}
-    pattern = "Average elapsed time: \((.*?)\) s, performance: \((.*?)\) GFLOPS. size: \((.*?)\)."
-    for line in lines:
-        if r := re.match(pattern, line):
-            data["size"].append(int(r.group(3)))
-            data["gflops"].append(float(r.group(2)))
-    return data
+def load_best_k10(
+    csv_path: Path,
+) -> tuple[dict[int, float], dict[int, int]]:
+    candidates: dict[int, list[tuple[float, int]]] = {
+        size: [] for size in MATRIX_SIZES
+    }
+    with csv_path.open(newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            size = int(row["size_m"])
+            if (
+                row["record_type"] == "phase3_tuning"
+                and row["status"] == "ok"
+                and size in candidates
+                and int(row["size_n"]) == size
+                and int(row["size_k"]) == size
+            ):
+                candidates[size].append(
+                    (float(row["kernel_gflops"]) / 1000.0, int(row["config_index"]))
+                )
+
+    best_tflops: dict[int, float] = {}
+    best_configs: dict[int, int] = {}
+    for size, rows in candidates.items():
+        if not rows:
+            raise ValueError(f"No successful Phase 3 K10 result for {size}^3")
+        best_tflops[size], best_configs[size] = max(rows)
+    return best_tflops, best_configs
 
 
-def plot(df: pd.DataFrame):
-    """
-    The dataframe has 3 columns: kernel, size, gflops
+def validate(results: dict[int, dict[int, float]]) -> None:
+    required = set(MATRIX_SIZES)
+    for kernel_id, by_size in results.items():
+        missing = sorted(required - set(by_size))
+        if missing:
+            raise ValueError(f"Kernel {kernel_id} is missing sizes: {missing}")
 
-    We want to plot the gflops for each kernel, for each size as a single seaborn multi-line plot.
-    """
-    save_dir = Path.cwd()
 
-    plt.figure(figsize=(18, 10))
-    colors = sn.color_palette("husl", len(df["kernel"].unique()))
-    sn.lineplot(data=df, x="size", y="gflops", hue="kernel", palette=colors)
-    # also plot points, but without legend
-    sn.scatterplot(data=df, x="size", y="gflops", hue="kernel", palette=colors, legend=False)
+def plot(
+    results: dict[int, dict[int, float]],
+    best_configs: dict[int, int],
+    output_path: Path,
+) -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 11,
+            "axes.titleweight": "bold",
+            "axes.edgecolor": "#64748b",
+            "axes.labelcolor": "#1e293b",
+            "xtick.color": "#334155",
+            "ytick.color": "#334155",
+        }
+    )
 
-    # set ticks at actual sizes
-    plt.xticks(df["size"].unique())
-    # rotate xticks, and align them
-    plt.xticks(rotation=45, ha="right", rotation_mode="anchor")
-    # add small lines at the xticks
+    fig, ax = plt.subplots(figsize=(15, 8), dpi=180)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
 
-    # display the kernel names right next to the corresponding line
-    for i, kernel in enumerate(df["kernel"].unique()):
-        # right align the text
-        plt.text(
-            df[df["kernel"] == i]["size"].iloc[-1],
-            df[df["kernel"] == i]["gflops"].iloc[-1] + 300,
-            f"{i}:{KERNEL_NAMES[i]}",
-            color=colors[i],
-            horizontalalignment="left",
-            weight="medium",
+    x_positions = list(range(len(MATRIX_SIZES)))
+    colors = list(plt.get_cmap("tab20").colors[:12])
+    markers = ["o", "s", "^", "v", "P", "X", "D", "<", ">", "*", "h", "p"]
+
+    for kernel_id in KERNEL_NAMES:
+        values = [results[kernel_id][size] for size in MATRIX_SIZES]
+        is_k10 = kernel_id == 10
+        is_experiment = kernel_id in (11, 12)
+        ax.plot(
+            x_positions,
+            values,
+            label=f"K{kernel_id}: {KERNEL_NAMES[kernel_id]}",
+            color="#e65100" if is_k10 else colors[kernel_id - 1],
+            linewidth=3.4 if is_k10 else 1.8,
+            linestyle="--" if is_experiment else "-",
+            marker=markers[kernel_id - 1],
+            markersize=8 if is_k10 else 5.5,
+            markeredgecolor="white",
+            markeredgewidth=0.8,
+            alpha=1.0 if is_k10 else 0.86,
+            zorder=5 if is_k10 else 2,
         )
 
-    # turn of the legend
-    plt.gca().get_legend().remove()
+    for x, size in enumerate(MATRIX_SIZES):
+        value = results[10][size]
+        ax.annotate(
+            f"{value:.2f}\nC{best_configs[size]}",
+            (x, value),
+            xytext=(0, 11),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            color="#9a3412",
+            fontsize=9,
+            fontweight="bold",
+        )
 
-    plt.title("Performance of different kernels")
-    plt.xlabel("Matrix size (square, one side)")
-    plt.ylabel("GFLOPs/s")
-    plt.tight_layout()
+    ax.set_xticks(x_positions, [str(size) for size in MATRIX_SIZES])
+    ax.set_xlim(-0.12, len(MATRIX_SIZES) - 0.88)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Square matrix size (M = N = K)")
+    ax.set_ylabel("Throughput (TFLOP/s)")
+    ax.set_title("FP32 GEMM Performance by Kernel and Matrix Size — RTX 5060 Ti")
+    ax.grid(axis="y", color="#cbd5e1", linewidth=0.8, alpha=0.75)
+    ax.grid(axis="x", color="#e2e8f0", linewidth=0.7, alpha=0.55)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
-    plt.savefig(save_dir / "benchmark_results.png")
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.13),
+        ncol=3,
+        frameon=False,
+        fontsize=9.5,
+        handlelength=2.5,
+        columnspacing=1.5,
+    )
+
+    fig.text(
+        0.5,
+        0.012,
+        "K10 uses the best successful Phase 3 configuration at each size; "
+        "all other lines use reports/baseline_5060ti.csv.",
+        ha="center",
+        color="#475569",
+        fontsize=9.5,
+    )
+    fig.tight_layout(rect=(0, 0.09, 1, 1))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def main() -> None:
+    project_root = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--baseline-input",
+        type=Path,
+        default=project_root / "reports" / "baseline_5060ti.csv",
+    )
+    parser.add_argument(
+        "--tuning-input",
+        type=Path,
+        default=project_root / "reports" / "phase3_tuning_results.csv",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=project_root / "benchmark_results.png",
+    )
+    args = parser.parse_args()
+
+    results = load_baseline(args.baseline_input)
+    results[10], best_configs = load_best_k10(args.tuning_input)
+    validate(results)
+    plot(results, best_configs, args.output)
+
+    selected = ", ".join(
+        f"{size}:C{best_configs[size]}" for size in MATRIX_SIZES
+    )
+    print(f"Wrote {args.output}")
+    print(f"K10 selections: {selected}")
 
 
 if __name__ == "__main__":
-    results_dir = Path("benchmark_results")
-    assert results_dir.is_dir()
-
-    data = []
-    for filename in results_dir.glob("*.txt"):
-        # filenames have the format: <kernel_nr>_output.txt
-        if not filename.stem.split("_")[0].isdigit() and "_output" not in filename.stem:
-            continue
-        results_dict = parse_file(filename)
-        kernel_nr = int(filename.stem.split("_")[0])
-        for size, gflops in zip(results_dict["size"], results_dict["gflops"]):
-            data.append({"kernel": kernel_nr, "size": size, "gflops": gflops})
-    df = pd.DataFrame(data)
-
-    plot(df)
-
-    df = df[df["size"] == 4096].sort_values(by="gflops", ascending=True)[["kernel", "gflops"]]
-    df["kernel"] = df["kernel"].map({k: f"{k}: {v}" for k, v in KERNEL_NAMES.items()})
-    df["relperf"] = df["gflops"] / df[df["kernel"] == "0: cuBLAS"]["gflops"].iloc[0]
-    df["relperf"] = df["relperf"].apply(lambda x: f"{x*100:.1f}%")
-    df.columns = ["Kernel", "GFLOPs/s", "Performance relative to cuBLAS"]
-
-    # update the README.md with the new results
-    with open("README.md", "r") as f:
-        readme = f.read()
-    # delete old results
-    readme = re.sub(
-        r"<!-- benchmark_results -->.*<!-- benchmark_results -->",
-        "<!-- benchmark_results -->\n{}\n<!-- benchmark_results -->".format(
-            df.to_markdown(index=False)
-        ),
-        readme,
-        flags=re.DOTALL,
-    )
-    # input new results
-    with open("README.md", "w") as f:
-        f.write(readme)
+    main()
